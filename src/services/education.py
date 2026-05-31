@@ -1,0 +1,336 @@
+import json
+import logging
+import uuid
+from typing import List, Type
+from src.exceptions import ObjectNotFoundException, MyAppException, ObjectAlreadyExistsException
+from src.models.education import EducationProgressOrm, educationThemeOrm
+from src.schemas.daily_tasks import DailyTaskId
+from src.schemas.education_material import (
+    EducationThemeResponse,
+    EducationMaterialResponse,
+    CardResponse,
+    EducationProgressResponse, CompleteEducation, EducationThemeAdd, EducationMaterialAdd, CardAdd,
+    GetUserEducationProgressResponse, EducationThemeWithMaterialsResponse, ThemeRecommendationResponse,
+    CompleteEducationTheme, EducationThemeCreate, EducationThemeUpdate, EducationMaterialCreate,
+    EducationMaterialUpdate, CardCreate, CardUpdate
+)
+from src.services.base import BaseService
+from src.services.daily_tasks import DailyTaskService
+from src.services.gamification import GamificationService
+
+logger = logging.getLogger(__name__)
+
+
+class EducationService(BaseService):
+    async def create_theme(self, data: EducationThemeCreate) -> EducationThemeResponse:
+        theme = EducationThemeAdd(id=uuid.uuid4(), **data.model_dump())
+        created = await self.db.education_theme.add(theme)
+        await self.db.commit()
+        return EducationThemeResponse.model_validate(created)
+
+    async def update_theme(
+        self, theme_id: uuid.UUID, data: EducationThemeUpdate
+    ) -> EducationThemeResponse:
+        existing = await self.db.education_theme.get_one_or_none(id=theme_id)
+        if not existing:
+            raise ObjectNotFoundException()
+        await self.db.education_theme.edit(data, exclude_unset=True, id=theme_id)
+        await self.db.commit()
+        updated = await self.db.education_theme.get_one(id=theme_id)
+        return EducationThemeResponse.model_validate(updated)
+
+    async def delete_theme(self, theme_id: uuid.UUID) -> None:
+        if not await self.db.education_theme.get_one_or_none(id=theme_id):
+            raise ObjectNotFoundException()
+        await self.db.education_theme.delete(id=theme_id)
+
+    async def create_material(
+        self, theme_id: uuid.UUID, data: EducationMaterialCreate
+    ) -> EducationMaterialResponse:
+        if not await self.db.education_theme.get_one_or_none(id=theme_id):
+            raise ObjectNotFoundException()
+        material = EducationMaterialAdd(
+            id=uuid.uuid4(),
+            education_theme_id=theme_id,
+            **data.model_dump(),
+        )
+        created = await self.db.education_material.add(material)
+        await self.db.commit()
+        return EducationMaterialResponse.model_validate(created)
+
+    async def update_material(
+        self, material_id: uuid.UUID, data: EducationMaterialUpdate
+    ) -> EducationMaterialResponse:
+        existing = await self.db.education_material.get_one_or_none(id=material_id)
+        if not existing:
+            raise ObjectNotFoundException()
+        await self.db.education_material.edit(data, exclude_unset=True, id=material_id)
+        await self.db.commit()
+        updated = await self.db.education_material.get_one(id=material_id)
+        return EducationMaterialResponse.model_validate(updated)
+
+    async def delete_material(self, material_id: uuid.UUID) -> None:
+        if not await self.db.education_material.get_one_or_none(id=material_id):
+            raise ObjectNotFoundException()
+        await self.db.education_material.delete(id=material_id)
+
+    async def create_card(
+        self, material_id: uuid.UUID, data: CardCreate
+    ) -> CardResponse:
+        if not await self.db.education_material.get_one_or_none(id=material_id):
+            raise ObjectNotFoundException()
+        card = CardAdd(
+            id=uuid.uuid4(),
+            education_material_id=material_id,
+            **data.model_dump(),
+        )
+        created = await self.db.education_card.add(card)
+        await self.db.commit()
+        return CardResponse.model_validate(created)
+
+    async def update_card(self, card_id: uuid.UUID, data: CardUpdate) -> CardResponse:
+        existing = await self.db.education_card.get_one_or_none(id=card_id)
+        if not existing:
+            raise ObjectNotFoundException()
+        await self.db.education_card.edit(data, exclude_unset=True, id=card_id)
+        await self.db.commit()
+        updated = await self.db.education_card.get_one(id=card_id)
+        return CardResponse.model_validate(updated)
+
+    async def delete_card(self, card_id: uuid.UUID) -> None:
+        if not await self.db.education_card.get_one_or_none(id=card_id):
+            raise ObjectNotFoundException()
+        await self.db.education_card.delete(id=card_id)
+
+    async def auto_create_education(self):
+
+        try:
+            await self._delete_all_education_data()
+
+            with open("src/services/info/education_themes.json", encoding="utf-8") as file:
+                themes_data = json.load(file)
+            await self._add_themes(themes_data)
+
+            with open("src/services/info/education_materials.json", encoding="utf-8") as file:
+                materials_data = json.load(file)
+            await self._add_materials(materials_data)
+
+            with open("src/services/info/education_cards.json", encoding="utf-8") as file:
+                cards_data = json.load(file)
+            await self._add_cards(cards_data)
+
+            await self.db.commit()
+            return {"status": "OK", "message": "Образовательные материалы успешно перезаписаны"}
+
+        except Exception as ex:
+            logger.error(
+                f"Ошибка при перезаписи образовательных материалов: {ex}")
+            await self.db.rollback()
+            raise MyAppException()
+
+    async def _delete_all_education_data(self):
+        """Удаляет все образовательные данные"""
+        from sqlalchemy import text
+
+        try:
+            tables = ['education_card', 'education_material', 'education_theme']
+
+            for table in tables:
+                try:
+                    await self.db.execute(text(f"DELETE FROM {table}"))
+                    logger.info(f"Данные из таблицы {table} удалены")
+                except Exception as e:
+                    logger.warning(f"Таблица {table} не существует или ошибка при удалении: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Ошибка при удалении данных: {e}")
+            raise
+
+    async def _add_themes(self, themes_data):
+        themes = [EducationThemeAdd.model_validate(
+            theme) for theme in themes_data]
+        new_count = 0
+        for theme in themes:
+            existing = await self.db.education_theme.get_one_or_none(id=theme.id)
+            if not existing:
+                await self.db.education_theme.add(theme)
+                new_count += 1
+        if new_count:
+            logger.info(f"{new_count} новых тем добавлено в базу.")
+        else:
+            logger.info("Все темы уже существуют в базе.")
+
+    async def _add_materials(self, materials_data):
+        materials = [EducationMaterialAdd.model_validate(
+            m) for m in materials_data]
+        new_count = 0
+        for material in materials:
+            existing = await self.db.education_material.get_one_or_none(id=material.id)
+            if not existing:
+                await self.db.education_material.add(material)
+                new_count += 1
+        if new_count:
+            logger.info(f"{new_count} новых материалов добавлено в базу.")
+        else:
+            logger.info("Все материалы уже существуют в базе.")
+
+    async def _add_cards(self, cards_data):
+        cards = [CardAdd.model_validate(card) for card in cards_data]
+        new_count = 0
+        for card in cards:
+            existing = await self.db.education_card.get_one_or_none(id=card.id)
+            if not existing:
+                await self.db.education_card.add(card)
+                new_count += 1
+        if new_count:
+            logger.info(f"{new_count} новых карточек добавлено в базу.")
+        else:
+            logger.info("Все карточки уже существуют в базе.")
+
+    async def get_all_education_themes(self) -> List[educationThemeOrm]:
+        try:
+            themes = await self.db.education_theme.get_all_with_materials_and_cards()
+            return themes
+        except ObjectNotFoundException:
+            raise
+        except Exception as ex:
+            logger.error(f"Error in get_all_education_themes: {ex}")
+            raise MyAppException()
+
+    async def get_education_theme_materials(self, theme_id: uuid.UUID, user_id: uuid.UUID) -> EducationThemeWithMaterialsResponse:
+        try:
+            theme = await self.db.education_theme.get_with_materials(theme_id)
+            if not theme:
+                raise ObjectNotFoundException(f"Theme with id {theme_id} not found")
+
+            # Рекомендации
+            recommendations = []
+            if theme.related_topics:
+                for topic_id in theme.related_topics:
+                    topic = await self.db.education_theme.get_orm_one_or_none(topic_id)
+                    if topic:
+                        recommendations.append(
+                            ThemeRecommendationResponse(
+                                id=topic.id,
+                                theme=topic.theme,
+                                link=topic.link or "",
+                                link_to_picture=topic.link_to_picture,
+                                tags=topic.tags
+                            )
+                        )
+
+            # Материалы с карточками
+            materials_response = []
+            for material in theme.education_materials:
+                cards_response = [
+                    CardResponse(
+                        id=card.id,
+                        text=card.text,
+                        number=card.number,
+                        link_to_picture=card.link_to_picture
+                    )
+                    for card in material.cards
+                ]
+
+                materials_response.append(
+                    EducationMaterialResponse(
+                        id=material.id,
+                        type=material.type,
+                        number=material.number,
+                        title=material.title,
+                        link_to_picture=material.link_to_picture,
+                        subtitle=material.subtitle,
+                        cards=cards_response
+                    )
+                )
+
+            ontology_temp = await self.db.ontology_entry.get_filtered(user_id=user_id)
+            for temp in ontology_temp:
+                if temp.destination_id == theme_id:
+                    await self.db.ontology_entry.delete(user_id=user_id, destination_id=theme_id)
+
+            return EducationThemeWithMaterialsResponse(
+                id=theme.id,
+                theme=theme.theme,
+                link=theme.link or "",
+                link_to_picture=theme.link_to_picture,
+                recommendations=recommendations,
+                education_materials=materials_response
+            )
+
+        except ObjectNotFoundException:
+            raise
+        except Exception as ex:
+            logger.error(f"Error in get_education_theme_materials: {ex}")
+            raise MyAppException()
+
+    async def complete_education_theme(self, payload: CompleteEducationTheme, user_id: uuid.UUID):
+        try:
+            daily_tasks = await DailyTaskService(self.db).get_daily_tasks(user_id)
+            for task in daily_tasks:
+                if task["destination_id"] == payload.education_theme_id:
+                    daily_task_id_data = DailyTaskId(daily_task_id=task["id"])
+                    await DailyTaskService(self.db).complete_daily_task(daily_task_id_data, user_id)
+
+        except ObjectNotFoundException:
+            raise
+        except ObjectAlreadyExistsException:
+            raise
+        except Exception as ex:
+            await self.db.rollback()
+            raise MyAppException()
+
+
+    async def complete_education_material(self, payload: CompleteEducation, user_id: uuid.UUID):
+        try:
+
+            material = await self.db.education_material.get_one_or_none(id=payload.education_material_id)
+            if not material:
+                raise ObjectNotFoundException
+
+            existing_progress = await self.db.education_progress.get_one_or_none(
+                user_id=user_id,
+                education_material_id=payload.education_material_id
+            )
+            if existing_progress:
+
+                raise ObjectAlreadyExistsException
+
+            progress_entity = EducationProgressResponse(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                education_material_id=payload.education_material_id
+            )
+            await self.db.education_progress.add(progress_entity)
+
+            gamification_service = GamificationService(self.db)
+            await gamification_service.add_points_for_activity(user_id, "theory_read")
+
+            await self.db.commit()
+
+            logger.info(
+                f"Пользователь {user_id} успешно завершил материал {payload.education_material_id}.")
+        except ObjectNotFoundException:
+            raise
+        except ObjectAlreadyExistsException:
+            raise
+        except Exception as ex:
+            await self.db.rollback()
+            raise MyAppException()
+
+    async def get_user_progress(self, user_id: uuid.UUID) -> List[GetUserEducationProgressResponse]:
+        try:
+            progress_entries = await self.db.education_progress.get_filtered(user_id=user_id)
+
+            return [
+                GetUserEducationProgressResponse(
+                    user_id=entry.user_id,
+                    education_material_id=entry.education_material_id
+                )
+                for entry in progress_entries
+            ]
+        except Exception as ex:
+            logger.error(
+                f"Ошибка при получении прогресса пользователя {user_id}: {ex}")
+            raise MyAppException()

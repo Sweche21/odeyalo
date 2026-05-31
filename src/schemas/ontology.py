@@ -1,0 +1,19 @@
+from typing import Optional
+
+from pydantic import BaseModel
+import datetime
+import uuid
+
+
+class OntologyEntry(BaseModel):
+    id: uuid.UUID
+    type: str
+    created_at: datetime.datetime
+    destination_id: uuid.UUID
+    destination_title: Optional[str] = None
+    link_to_picture: Optional[str] = None
+    user_id: uuid.UUID
+
+
+
+
